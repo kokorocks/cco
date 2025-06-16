@@ -2,183 +2,120 @@ import {
   BufferAttribute,
   BufferGeometry,
   Quaternion,
-  Vector3
+  Vector3,
+  Euler
 } from 'https://cdn.skypack.dev/three@0.128.0/build/three.module.js';
 
-// Helper: Parallel transport a frame along the curve
-function parallelTransportFrames(curve, segments, bankFunc) {
-  const tangents = [], normals = [], binormals = [];
-
-  // Start with a fixed initial normal (usually up)
-  let prevTangent = curve.getTangentAt(0).clone().normalize();
-  let normal = new Vector3(0, 1, 0);
-  if (Math.abs(prevTangent.dot(normal)) > 0.999) {
-    normal = new Vector3(1, 0, 0); // Avoid parallel up vector
-  }
-  let binormal = new Vector3().crossVectors(prevTangent, normal).normalize();
-  normal.crossVectors(binormal, prevTangent).normalize();
-
-  tangents.push(prevTangent.clone());
-  normals.push(normal.clone());
-  binormals.push(binormal.clone());
-
-  for (let i = 1; i <= segments; ++i) {
-    const t = i / segments;
-    const tangent = curve.getTangentAt(t).clone().normalize();
-
-    // Compute rotation to align previous tangent to current tangent
-    const axis = new Vector3().crossVectors(prevTangent, tangent);
-    let angle = Math.asin(axis.length());
-    if (prevTangent.dot(tangent) < 0) angle = Math.PI;
-
-    if (axis.length() > 1e-6) {
-      axis.normalize();
-      const q = new Quaternion().setFromAxisAngle(axis, angle);
-      normal.applyQuaternion(q);
-      binormal.applyQuaternion(q);
-    }
-
-    // Apply banking (roll) about the tangent
-    const bank = bankFunc ? bankFunc(t) : 0;
-    if (bank) {
-      const qBank = new Quaternion().setFromAxisAngle(tangent, bank);
-      normal.applyQuaternion(qBank);
-      binormal.applyQuaternion(qBank);
-    }
-
-    tangents.push(tangent.clone());
-    normals.push(normal.clone());
-    binormals.push(binormal.clone());
-    prevTangent = tangent;
-  }
-  return { tangents, normals, binormals };
+// Helper: Spherical linear interpolation for Euler angles
+function lerpAngle(a, b, t) {
+  let diff = b - a;
+  while (diff > Math.PI) diff -= 2 * Math.PI;
+  while (diff < -Math.PI) diff += 2 * Math.PI;
+  return a + diff * t;
 }
 
-// Geometry
-class RollerCoasterTrackGeometry extends BufferGeometry {
-  constructor(curve, divisions, options = {}) {
+// Helper: SLERP between two Euler rotations (as XYZ order)
+function lerpEuler(e0, e1, t) {
+  return new Euler(
+    lerpAngle(e0.x, e1.x, t),
+    lerpAngle(e0.y, e1.y, t),
+    lerpAngle(e0.z, e1.z, t),
+    "XYZ"
+  );
+}
+
+/**
+ * points: Array of [x, y, z, zrot] OR [x, y, z, xrot, yrot, zrot]
+ *    - xrot, yrot, zrot are in radians and optional (default 0)
+ * divisions: number of segments to build
+ * options: { colorFunc, ... }
+ */
+class CustomRollerCoasterGeometry extends BufferGeometry {
+  constructor(points, divisions = 300, options = {}) {
     super();
 
     const vertices = [];
-    const normalsA = [];
+    const normals = [];
     const colors = [];
 
-    // Options
-    const defaultColor1 = [1, 1, 1];
-    const defaultColor2 = [1, 1, 0];
-    const bankFunc = options.bankFunc || (() => 0);
-    const colorFunc = options.colorFunc || ((t, type) => (type === 1 ? defaultColor1 : defaultColor2));
-    const coasterType = options.coasterType || 'B&M';
+    const colorFunc = options.colorFunc || ((t, type) => [1, 1, 1]);
+    const railRadius = options.railRadius || 0.06;
+    const railSides = options.railSides || 8;
 
-    // Cross-sections for coaster styles
-    const PI2 = Math.PI * 2;
-    function makeTube(sides, radius) {
-      const arr = [];
-      for (let i = 0; i < sides; i++) {
-        const angle = (i / sides) * PI2;
-        arr.push(new Vector3(Math.cos(angle) * radius, Math.sin(angle) * radius, 0));
-      }
-      return arr;
-    }
-    const crossSections = {
-      'B&M': [makeTube(5, 0.06), makeTube(6, 0.025), makeTube(6, 0.025)],
-      'skeleton': [makeTube(4, 0.03)],
-      'default': [makeTube(5, 0.06), makeTube(6, 0.025), makeTube(6, 0.025)]
-    };
+    // Prepare arrays for positions and rotations
+    const positions = points.map(p => new Vector3(p[0], p[1], p[2]));
+    const eulers = points.map(p => {
+      // [x, y, z, xrot, yrot, zrot] or [x, y, z, zrot]
+      if (p.length >= 6) return new Euler(p[3] || 0, p[4] || 0, p[5] || 0, "XYZ");
+      return new Euler(0, 0, p[3] || 0, "XYZ"); // Only zrot supplied
+    });
 
-    const offset = new Vector3();
-    const section = crossSections[coasterType] || crossSections['default'];
+    // Interpolator for position and rotation
+    function getAt(t) {
+      const L = positions.length - 1;
+      const idx = Math.floor(t * L);
+      const t0 = idx / L, t1 = (idx + 1) / L;
+      const localT = (t - t0) / (t1 - t0);
 
-    // Compute parallel transport frames
-    const { tangents, normals, binormals } = parallelTransportFrames(curve, divisions, bankFunc);
+      const p0 = positions[idx], p1 = positions[Math.min(idx + 1, L)];
+      const pos = new Vector3().lerpVectors(p0, p1, localT);
 
-    // Extrude helper (same as before, but now using frames)
-    function extrudeShape(shape, offset, color, i) {
-      const v1 = new Vector3(), v2 = new Vector3(), v3 = new Vector3(), v4 = new Vector3();
-      const n1 = new Vector3(), n2 = new Vector3(), n3 = new Vector3(), n4 = new Vector3();
-      for (let j = 0, jl = shape.length; j < jl; j++) {
-        const p1 = shape[j], p2 = shape[(j + 1) % jl];
+      const e0 = eulers[idx], e1 = eulers[Math.min(idx + 1, L)];
+      const e = lerpEuler(e0, e1, localT);
+      const quat = new Quaternion().setFromEuler(e);
 
-        // Current and previous frames
-        const bin = binormals[i], nor = normals[i], tan = tangents[i];
-        const binPrev = binormals[i - 1], norPrev = normals[i - 1], tanPrev = tangents[i - 1];
+      // Tangent is useful for train/camera orientation
+      const tangent = new Vector3().subVectors(p1, p0).normalize();
 
-        // Build basis (columns: binormal, normal, tangent)
-        function basisMatrix(b, n, t) {
-          return {
-            elements: [
-              b.x, n.x, t.x,
-              b.y, n.y, t.y,
-              b.z, n.z, t.z
-            ],
-            applyToVector3: function(v) {
-              const e = this.elements;
-              const x = v.x, y = v.y, z = v.z;
-              v.x = e[0] * x + e[1] * y + e[2] * z;
-              v.y = e[3] * x + e[4] * y + e[5] * z;
-              v.z = e[6] * x + e[7] * y + e[8] * z;
-              return v;
-            }
-          };
-        }
-        Vector3.prototype.applyMatrix3 = function(m) {
-          if (typeof m.applyToVector3 === 'function') {
-            return m.applyToVector3(this);
-          }
-          const e = m.elements;
-          const x = this.x, y = this.y, z = this.z;
-          this.x = e[0] * x + e[1] * y + e[2] * z;
-          this.y = e[3] * x + e[4] * y + e[5] * z;
-          this.z = e[6] * x + e[7] * y + e[8] * z;
-          return this;
-        };
-
-        const p = curve.getPointAt(i / divisions);
-        const prevP = curve.getPointAt((i - 1) / divisions);
-
-        v1.copy(p1).add(offset).applyMatrix3(basisMatrix(bin, nor, tan)).add(p);
-        v2.copy(p2).add(offset).applyMatrix3(basisMatrix(bin, nor, tan)).add(p);
-        v3.copy(p2).add(offset).applyMatrix3(basisMatrix(binPrev, norPrev, tanPrev)).add(prevP);
-        v4.copy(p1).add(offset).applyMatrix3(basisMatrix(binPrev, norPrev, tanPrev)).add(prevP);
-
-        // Two triangles per segment
-        vertices.push(v1.x, v1.y, v1.z, v2.x, v2.y, v2.z, v4.x, v4.y, v4.z);
-        vertices.push(v2.x, v2.y, v2.z, v3.x, v3.y, v3.z, v4.x, v4.y, v4.z);
-
-        // Normals (approximate)
-        n1.copy(p1).applyMatrix3(basisMatrix(bin, nor, tan)).normalize();
-        n2.copy(p2).applyMatrix3(basisMatrix(bin, nor, tan)).normalize();
-        n3.copy(p2).applyMatrix3(basisMatrix(binPrev, norPrev, tanPrev)).normalize();
-        n4.copy(p1).applyMatrix3(basisMatrix(binPrev, norPrev, tanPrev)).normalize();
-
-        normalsA.push(n1.x, n1.y, n1.z, n2.x, n2.y, n2.z, n4.x, n4.y, n4.z);
-        normalsA.push(n2.x, n2.y, n2.z, n3.x, n3.y, n3.z, n4.x, n4.y, n4.z);
-
-        for (let k = 0; k < 6; k++) colors.push(...color);
-      }
+      return { pos, quat, tangent };
     }
 
-    // Extrude actual geometry
-    for (let i = 1; i <= divisions; i++) {
-      const t = i / divisions;
+    // Build a ring for the rail cross-section
+    function makeRailRing(radius, sides) {
+      const ring = [];
+      for (let i = 0; i < sides; ++i) {
+        const theta = (i / sides) * Math.PI * 2;
+        ring.push(new Vector3(Math.cos(theta) * radius, Math.sin(theta) * radius, 0));
+      }
+      return ring;
+    }
+    const ring = makeRailRing(railRadius, railSides);
 
-      // Colors
-      const color1 = colorFunc(t, 1);
-      const color2 = colorFunc(t, 2);
+    // Extrude the tube along the track using the per-point rotation
+    for (let i = 0; i < divisions; ++i) {
+      const t0 = i / divisions, t1 = (i + 1) / divisions;
+      const { pos: p0, quat: q0 } = getAt(t0);
+      const { pos: p1, quat: q1 } = getAt(t1);
 
-      if (coasterType === 'skeleton') {
-        extrudeShape(section[0], offset.set(0, -0.05, 0), color2, i);
-      } else {
-        extrudeShape(section[0], offset.set(0, -0.125, 0), color2, i);
-        extrudeShape(section[1], offset.set(0.2, 0, 0), color1, i);
-        extrudeShape(section[2], offset.set(-0.2, 0, 0), color1, i);
+      const color = colorFunc(t0, 1);
+
+      for (let j = 0; j < railSides; ++j) {
+        const v0 = ring[j].clone().applyQuaternion(q0).add(p0);
+        const v1 = ring[(j + 1) % railSides].clone().applyQuaternion(q0).add(p0);
+        const v2 = ring[(j + 1) % railSides].clone().applyQuaternion(q1).add(p1);
+        const v3 = ring[j].clone().applyQuaternion(q1).add(p1);
+
+        // Triangles
+        vertices.push(v0.x, v0.y, v0.z, v1.x, v1.y, v1.z, v3.x, v3.y, v3.z);
+        vertices.push(v1.x, v1.y, v1.z, v2.x, v2.y, v2.z, v3.x, v3.y, v3.z);
+
+        // Approximate normals (out from center)
+        const n0 = ring[j].clone().normalize().applyQuaternion(q0);
+        const n1 = ring[(j + 1) % railSides].clone().normalize().applyQuaternion(q0);
+        const n2 = ring[(j + 1) % railSides].clone().normalize().applyQuaternion(q1);
+        const n3 = ring[j].clone().normalize().applyQuaternion(q1);
+
+        normals.push(n0.x, n0.y, n0.z, n1.x, n1.y, n1.z, n3.x, n3.y, n3.z);
+        normals.push(n1.x, n1.y, n1.z, n2.x, n2.y, n2.z, n3.x, n3.y, n3.z);
+
+        for (let k = 0; k < 6; ++k) colors.push(...color);
       }
     }
 
     this.setAttribute('position', new BufferAttribute(new Float32Array(vertices), 3));
-    this.setAttribute('normal', new BufferAttribute(new Float32Array(normalsA), 3));
+    this.setAttribute('normal', new BufferAttribute(new Float32Array(normals), 3));
     this.setAttribute('color', new BufferAttribute(new Float32Array(colors), 3));
   }
 }
 
-export { RollerCoasterTrackGeometry };
+export { CustomRollerCoasterGeometry };
