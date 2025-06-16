@@ -15,7 +15,7 @@ import {
  *   railRadius, railSides
  * }
  */
-export class CustomRollerCoasterTrackGeometry extends BufferGeometry {
+export class RollerCoasterTrackGeometry extends BufferGeometry {
   constructor(curve, divisions = 300, options = {}) {
     super();
 
