@@ -116,12 +116,13 @@ class RollerCoasterTrackGeometry extends BufferGeometry {
       right.crossVectors(up, forward).normalize();
       up.crossVectors(forward, right);
 
-      // Z rotation/banking
+      /*// Z rotation/banking
       const baseAngle = Math.atan2(forward.x, forward.z);
       const bankAngle = bankFunc(t);
       quaternion.setFromAxisAngle(up, baseAngle);
       const bankQuat = new Quaternion().setFromAxisAngle(forward, bankAngle);
-      quaternion.multiply(bankQuat);
+      quaternion.multiply(bankQuat);*/
+      quaternion.identity(); // No rotation applied, keeps the cross-section level
 
       // Colors
       const color1 = colorFunc(t, 1);
